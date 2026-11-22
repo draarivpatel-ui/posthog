@@ -2099,12 +2099,6 @@ database "posthog" {
       type    = "String"
       comment = "column_materializer::properties::$feature_flag_request_id"
     }
-    column "properties_group_custom" {
-      type = "Map(String, String)"
-    }
-    column "person_properties_map_custom" {
-      type = "Map(String, String)"
-    }
     column "_timestamp" {
       type = "DateTime"
     }
@@ -2113,6 +2107,12 @@ database "posthog" {
     }
     column "_partition" {
       type = "UInt64"
+    }
+    column "properties_group_custom" {
+      type = "Map(String, String)"
+    }
+    column "person_properties_map_custom" {
+      type = "Map(String, String)"
     }
     engine "distributed" {
       cluster_name    = "flags"

@@ -777,21 +777,21 @@ def assemble(
         logger.warning("dashboard_v2_bucket_store_write_failed", store_key=store.key, exc_info=True)
 
     # Walked in answer order and stopped one row past the limit, so stored buckets past it are never decoded.
-    rows: list[list[Any]] = []
+    answer_rows: list[list[Any]] = []
     stored_read = 0
     for bucket in sorted(stored.keys() | by_bucket.keys(), reverse=query.order == "DESC"):
-        if len(rows) > limit:
+        if len(answer_rows) > limit:
             break
         if bucket in by_bucket:
-            rows.extend(_json_rows(by_bucket[bucket]))
+            answer_rows.extend(_json_rows(by_bucket[bucket]))
         else:
-            rows.extend(store.unpack(stored[bucket]))
+            answer_rows.extend(store.unpack(stored[bucket]))
             stored_read += 1
-    has_more = len(rows) > limit
+    has_more = len(answer_rows) > limit
     return BucketedAnswer(
         columns=columns,
         types=types,
-        rows=rows[:limit],
+        rows=answer_rows[:limit],
         has_more=has_more,
         parts=sorted(parts, key=lambda part: part.start),
         stored_buckets=stored_read,

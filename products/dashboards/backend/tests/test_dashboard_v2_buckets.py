@@ -174,6 +174,21 @@ class TestAssembleBuckets(SimpleTestCase):
         )
         self.assertEqual(events.runs, [(now - timedelta(days=14), now - timedelta(days=7))])
 
+    def test_a_warm_range_decodes_stored_buckets_only_up_to_its_row_limit(self) -> None:
+        tz = ZoneInfo("UTC")
+        events = _Events("hour", tz)
+        start = datetime(2026, 5, 1, tzinfo=UTC)
+        events.timestamps = [start + timedelta(minutes=13 * i) for i in range(2000)]
+        now = start + timedelta(days=14)
+        store = self._store()
+        self._run(events, store, start, now, now)
+
+        answer = self._run(events, store, start, now, now, limit=5)
+
+        self.assertEqual(_answer_json(answer.rows), _as_json(events.whole(start, now))[:5])
+        self.assertTrue(answer.has_more)
+        self.assertLessEqual(answer.stored_buckets, 6)
+
     def test_buckets_off_the_project_timezone_grid_are_refused(self) -> None:
         events = _Events("hour", ZoneInfo("UTC"))
         start = datetime(2026, 5, 1, tzinfo=UTC)
@@ -330,6 +345,12 @@ class TestCheckBucketed(SimpleTestCase):
                 "bucket_in_utc",
                 "SELECT toStartOfHour(timestamp, 'UTC') AS t, count() FROM events WHERE {filters} GROUP BY t",
                 "first column",
+            ),
+            (
+                "shifted_date_bound",
+                "SELECT toStartOfHour(timestamp) AS t, count() FROM events WHERE {filters} "
+                "AND timestamp < {filters.dateRange.from} + INTERVAL 1 HOUR GROUP BY t",
+                "timestamp >= from",
             ),
             (
                 "seven_minutes",

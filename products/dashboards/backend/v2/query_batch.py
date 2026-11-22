@@ -317,6 +317,8 @@ class _ServedKey:
     cache_key: str
     swr: bool
     cache_only: bool
+    # A bucketed panel reruns a stale entry that a non-bucketed one serves, so the two never share a hit.
+    bucketed: bool
     query: str
 
 
@@ -325,6 +327,7 @@ def _served_key(planned: PlannedQuery, item: QueryBatchInput) -> _ServedKey:
         cache_key=planned.cache_key,
         swr=item.swr,
         cache_only=item.cache_only,
+        bucketed=item.target.bucketed,
         query=json.dumps(planned.upgraded_query, sort_keys=True, default=str),
     )
 
@@ -588,6 +591,9 @@ class QueryBatch:
                 # A bucketed run reruns only the newest buckets, so it is cheaper to run than to serve stale.
                 serve_stale = item.cache_only or (item.swr and not item.target.bucketed)
                 if stale and not serve_stale:
+                    # The entry was downloaded and decoded already, so it counts against the read budget unserved.
+                    self._read_bytes += len(_render_body(_result_line(index, response, hit=True, stale=stale)))
+                    del response
                     to_run.append(index)
                     continue
                 body = _render_body(_result_line(index, response, hit=True, stale=stale))

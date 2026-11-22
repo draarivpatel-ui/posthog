@@ -172,8 +172,10 @@ class _Scan(TraversingVisitor):
         self.top_date_filter: set[str] = set()
         self.dates_outside_where = False
         self.tables: set[str] = set()
+        self.loose_date_bounds = False
         self._in_top_where = False
         self._top_where_placeholders: set[int] = set()
+        self._canonical_bounds: set[int] = set()
 
     def visit_select_query(self, node: ast.SelectQuery) -> None:
         self.depth += 1
@@ -189,6 +191,30 @@ class _Scan(TraversingVisitor):
             super().visit_select_query(node)
         finally:
             self.depth -= 1
+
+    def visit_compare_operation(self, node: ast.CompareOperation) -> None:
+        # Only `timestamp >= {filters.dateRange.from}` and `timestamp < {filters.dateRange.to}` hold per bucket: any
+        # other use of a bound moves with the range, so a stored bucket would not match a whole run.
+        if self.depth == 1 and self._in_top_where:
+            left, right = _unalias(node.left), node.right
+            if (
+                isinstance(left, ast.Field)
+                and left.chain[-1] == "timestamp"
+                and isinstance(right, ast.Placeholder)
+                and right.chain is not None
+                and (
+                    (
+                        list(right.chain) == ["filters", "dateRange", "from"]
+                        and node.op in (ast.CompareOperationOp.GtEq, ast.CompareOperationOp.Gt)
+                    )
+                    or (
+                        list(right.chain) == ["filters", "dateRange", "to"]
+                        and node.op in (ast.CompareOperationOp.Lt, ast.CompareOperationOp.LtEq)
+                    )
+                )
+            ):
+                self._canonical_bounds.add(id(right))
+        super().visit_compare_operation(node)
 
     def visit_window_function(self, node: ast.WindowFunction) -> None:
         self.window = True
@@ -221,6 +247,8 @@ class _Scan(TraversingVisitor):
             elif self._in_top_where:
                 self.top_date_filter.add(".".join(str(part) for part in chain))
                 self._top_where_placeholders.add(id(node))
+                if "dateRange" in chain and id(node) not in self._canonical_bounds:
+                    self.loose_date_bounds = True
             elif id(node) not in self._top_where_placeholders:
                 self.dates_outside_where = True
         super().visit_placeholder(node)
@@ -299,6 +327,11 @@ def check_bucketed(query: str) -> BucketedQuery:
         problems.append("a subquery reads the date range, so it can aggregate across buckets")
     if scan.dates_outside_where:
         problems.append("it reads the date range outside its WHERE, so each run would see different bounds")
+    if scan.loose_date_bounds:
+        problems.append(
+            "it uses {filters.dateRange.from} or {filters.dateRange.to} other than as timestamp >= from and "
+            "timestamp < to, so a bucket's rows depend on the range"
+        )
     if scan.compare:
         problems.append("it compares with a previous period")
     if _ACTIVITY_LOGS_TABLE in scan.tables:
@@ -441,16 +474,23 @@ class BucketStore:
             return b"", None
         return raw, StoreMeta.decode(raw)
 
-    def read(self, buckets: Sequence[datetime]) -> tuple[Optional[StoreMeta], dict[datetime, list[list[Any]]]]:
-        """The stretch the store holds now, read with the buckets so a store that expired meanwhile shows."""
+    def read(self, buckets: Sequence[datetime]) -> tuple[Optional[StoreMeta], dict[datetime, bytes]]:
+        """The stretch the store holds now, read with the buckets so a store that expired meanwhile shows. Buckets
+        stay packed: `unpack` decodes only those the answer reaches, so its row limit bounds memory."""
         try:
             raw, *values = storage.query_cache_read_client().hmget(
                 self.key, [_META, *(_field(bucket) for bucket in buckets)]
             )
-            rows = {bucket: orjson.loads(zstd.decompress(value)) for bucket, value in zip(buckets, values) if value}
         except Exception as e:
             raise BucketStoreError("the store could not be read") from e
-        return (StoreMeta.decode(raw) if raw else None), rows
+        packed = {bucket: value for bucket, value in zip(buckets, values) if value}
+        return (StoreMeta.decode(raw) if raw else None), packed
+
+    def unpack(self, packed: bytes) -> list[list[Any]]:
+        try:
+            return orjson.loads(zstd.decompress(packed))
+        except Exception as e:
+            raise BucketStoreError("the store could not be read") from e
 
     def write(self, *, expected: bytes, meta: StoreMeta, buckets: dict[datetime, bytes], reset: bool) -> bool:
         """`buckets` holds each bucket's rows as `pack` makes them."""
@@ -701,7 +741,7 @@ def assemble(
                 to_store[bucket] = rows
         parts.append(Part(start=start, end=end, source="clickhouse"))
 
-    stored: dict[datetime, list[list[Any]]] = {}
+    stored: dict[datetime, bytes] = {}
     if served is not None:
         held, stored = store.read(grid.starts(served.start, served.end))
         if held is None or not Span(start=held.start, end=held.end).contains(served):
@@ -736,10 +776,17 @@ def assemble(
         BUCKETED_RUNS.labels(outcome="write_failed").inc()
         logger.warning("dashboard_v2_bucket_store_write_failed", store_key=store.key, exc_info=True)
 
-    fetched = {bucket: _json_rows(rows) for bucket, rows in by_bucket.items()}
-    combined = {**stored, **fetched}
-    ordered = sorted(combined, reverse=query.order == "DESC")
-    rows = [row for bucket in ordered for row in combined[bucket]]
+    # Walked in answer order and stopped one row past the limit, so stored buckets past it are never decoded.
+    rows: list[list[Any]] = []
+    stored_read = 0
+    for bucket in sorted(stored.keys() | by_bucket.keys(), reverse=query.order == "DESC"):
+        if len(rows) > limit:
+            break
+        if bucket in by_bucket:
+            rows.extend(_json_rows(by_bucket[bucket]))
+        else:
+            rows.extend(store.unpack(stored[bucket]))
+            stored_read += 1
     has_more = len(rows) > limit
     return BucketedAnswer(
         columns=columns,
@@ -747,7 +794,7 @@ def assemble(
         rows=rows[:limit],
         has_more=has_more,
         parts=sorted(parts, key=lambda part: part.start),
-        stored_buckets=len(stored),
+        stored_buckets=stored_read,
         far=far,
     )
 

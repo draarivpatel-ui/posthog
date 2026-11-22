@@ -951,7 +951,7 @@ export const emailTemplaterLogic = kea<emailTemplaterLogicType>([
         },
     })),
 
-    listeners(({ props, values, actions, asyncActions, cache, isMounted }) => ({
+    listeners(({ props, values, actions, asyncActions, cache }) => ({
         // Person properties load after the editor starts, and the editor only reads its options once.
         loadPersonPropertyDefinitionsSuccess: () => {
             const mergeTags = buildMergeTags(values.personPropertyDefinitions, props.type, props.variables)
@@ -1246,7 +1246,7 @@ export const emailTemplaterLogic = kea<emailTemplaterLogicType>([
                         EDITOR_READ_TIMEOUT_MS
                     )
                 } catch (error) {
-                    if (!isMounted()) {
+                    if (cache.unmounted) {
                         return
                     }
                     posthog.captureException(error)
@@ -1259,7 +1259,7 @@ export const emailTemplaterLogic = kea<emailTemplaterLogicType>([
                     return
                 }
                 // An editor that closed while it was read can't be read again, but its last edit still goes to the form.
-                const closed = !isMounted()
+                const closed = !!cache.unmounted
                 if (!closed && cache.designEdits !== editsBeforeExport) {
                     continue
                 }
@@ -1448,7 +1448,8 @@ export const emailTemplaterLogic = kea<emailTemplaterLogicType>([
         actions.runEmailConversion()
     }),
 
-    beforeUnmount(({ props, values }) => {
+    beforeUnmount(({ props, values, cache }) => {
+        cache.unmounted = true
         // An unmount while open (switching nodes, closing the step panel) skips the close action,
         // and the node URL sync preserves foreign search params - so strip ours here, or the next
         // email editor to mount would read the lingering param and auto-open.

@@ -173,6 +173,7 @@ class _Scan(TraversingVisitor):
         self.dates_outside_where = False
         self.tables: set[str] = set()
         self.loose_date_bounds = False
+        self.joined = False
         self._in_top_where = False
         self._top_where_placeholders: set[int] = set()
         self._canonical_bounds: set[int] = set()
@@ -228,6 +229,8 @@ class _Scan(TraversingVisitor):
         super().visit_call(node)
 
     def visit_join_expr(self, node: ast.JoinExpr) -> None:
+        if self.depth == 1 and node.next_join is not None:
+            self.joined = True
         if isinstance(node.table, ast.Field):
             self.tables.add(".".join(str(part) for part in node.table.chain))
         super().visit_join_expr(node)
@@ -327,6 +330,8 @@ def check_bucketed(query: str) -> BucketedQuery:
         problems.append("a subquery reads the date range, so it can aggregate across buckets")
     if scan.dates_outside_where:
         problems.append("it reads the date range outside its WHERE, so each run would see different bounds")
+    if scan.joined:
+        problems.append("it joins tables, so its date bound may not be on the bucket's timestamp")
     if scan.loose_date_bounds:
         problems.append(
             "it uses {filters.dateRange.from} or {filters.dateRange.to} other than as timestamp >= from and "
